@@ -34,6 +34,7 @@
 
 #  if SANITIZER_POSIX
 #    include "sanitizer_common/sanitizer_posix.h"
+#    include "sanitizer_common/sanitizer_platform_limits_posix.h"
 #  endif
 
 #  if ASAN_INTERCEPT__UNWIND_RAISEEXCEPTION || \
@@ -79,6 +80,10 @@ void SetThreadName(const char* name) {
 }
 
 int OnExit() {
+  // Flush signal-safety report before _exit/_Exit bypasses atexit handlers.
+  if (flags()->detect_signal_unsafe_writes)
+    FlushSignalSafetyReport();
+
   if (CAN_SANITIZE_LEAKS && common_flags()->detect_leaks &&
       __lsan::HasReportedLeaks()) {
     return common_flags()->exitcode;
@@ -268,8 +273,71 @@ static int munmap_interceptor(Munmap real_munmap, void* addr, SIZE_T length) {
       AsanInitFromRtl();             \
     } while (false)
 
+namespace __asan {
+extern ::__sanitizer::__sanitizer_sigaction user_signal_actions[];
+void asan_signal_trampoline(int sig, ::__sanitizer::__sanitizer_siginfo *info, void *ctx);
+void asan_signal_trampoline_handler(int sig);
+}  // namespace __asan
+
+#  define SIGNAL_INTERCEPTOR_SIGACTION_IMPL(signum, act, oldact)              \
+    {                                                                          \
+      if (act && flags()->detect_signal_unsafe_writes &&                       \
+          (unsigned)(signum) < 64) {                                           \
+        bool is_siginfo = (act->sa_flags & __sanitizer::sa_siginfo) &&        \
+                           act->sigaction;                                      \
+        bool is_handler = !is_siginfo && act->handler &&                       \
+                          act->handler != (__sanitizer_sighandler_ptr)1 &&      \
+                          act->handler != (__sanitizer_sighandler_ptr)0;        \
+        if (is_siginfo || is_handler) {                                        \
+          __asan_signal_handler_registered = 1;                                \
+          __sanitizer_sigaction modified_act;                                   \
+          internal_memcpy(&modified_act, act, sizeof(modified_act));            \
+          internal_memcpy(&__asan::user_signal_actions[signum], act,            \
+                          sizeof(__asan::user_signal_actions[signum]));         \
+          if (is_siginfo)                                                       \
+            modified_act.sigaction =                                            \
+                (__sanitizer_sigactionhandler_ptr)                              \
+                    __asan::asan_signal_trampoline;                             \
+          else                                                                  \
+            modified_act.handler = (__sanitizer_sighandler_ptr)                 \
+                __asan::asan_signal_trampoline_handler;                         \
+          return REAL(sigaction_symname)(signum, &modified_act, oldact);        \
+        }                                                                      \
+      }                                                                        \
+      return REAL(sigaction_symname)(signum, act, oldact);                     \
+    }
+
+#  define SIGNAL_INTERCEPTOR_SIGNAL_IMPL(func, signum, handler)                \
+    {                                                                          \
+      if (flags()->detect_signal_unsafe_writes &&                              \
+          (uptr)(handler) > 1 && (unsigned)(signum) < 64) {                    \
+        __asan_signal_handler_registered = 1;                                  \
+        __asan::user_signal_actions[signum].handler =                          \
+            (__sanitizer_sighandler_ptr)(handler);                             \
+        return (uptr)REAL(func)(                                               \
+            signum, (uptr)__asan::asan_signal_trampoline_handler);             \
+      }                                                                        \
+      return REAL(func)(signum, handler);                                      \
+    }
+
 #  include "sanitizer_common/sanitizer_common_interceptors.inc"
 #  include "sanitizer_common/sanitizer_signal_interceptors.inc"
+
+// Intercept the deprecated sigset() function. On glibc, sigset() calls
+// __sigaction internally, bypassing our sigaction interceptor.
+#  if SANITIZER_LINUX
+INTERCEPTOR(uptr, sigset, int signum, uptr handler) {
+  if (flags()->detect_signal_unsafe_writes &&
+      (uptr)(handler) > 1 && (unsigned)(signum) < 64) {
+    __asan_signal_handler_registered = 1;
+    __asan::user_signal_actions[signum].handler =
+        (__sanitizer_sighandler_ptr)(handler);
+    return (uptr)REAL(sigset)(
+        signum, (uptr)__asan::asan_signal_trampoline_handler);
+  }
+  return REAL(sigset)(signum, handler);
+}
+#  endif  // SANITIZER_LINUX
 
 // Syscall interceptors don't have contexts, we don't support suppressions
 // for them.
@@ -904,6 +972,10 @@ void InitializeAsanInterceptors() {
   InitializePlatformInterceptors();
   InitializeCommonInterceptors();
   InitializeSignalInterceptors();
+
+#  if SANITIZER_LINUX
+  ASAN_INTERCEPT_FUNC(sigset);
+#  endif
 
   // Intercept str* functions.
   ASAN_INTERCEPT_FUNC(strcat);

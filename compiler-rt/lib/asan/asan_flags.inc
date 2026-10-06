@@ -171,3 +171,8 @@ ASAN_FLAG(bool, verify_asan_link_order, true,
 ASAN_FLAG(
     bool, windows_hook_rtl_allocators, false,
     "(Windows only) enable hooking of Rtl(Allocate|Free|Size|ReAllocate)Heap.")
+ASAN_FLAG(bool, detect_signal_unsafe_writes, false,
+          "If true, collect signal-safety candidates (writes, calls) in both "
+          "main thread and signal handlers, then match and report violations "
+          "at exit. Requires recompilation with "
+          "-asan-detect-signal-unsafe-writes.")

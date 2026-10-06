@@ -469,6 +469,56 @@ static cl::opt<int> ClDebugMin("asan-debug-min", cl::desc("Debug min inst"),
 static cl::opt<int> ClDebugMax("asan-debug-max", cl::desc("Debug max inst"),
                                cl::Hidden, cl::init(-1));
 
+static cl::opt<bool> ClDetectSignalUnsafeWrites(
+    "asan-detect-signal-unsafe-writes",
+    cl::desc("Instrument large non-atomic stores to detect writes inside "
+             "signal handlers"),
+    cl::Hidden, cl::init(false));
+
+static cl::opt<bool> ClDetectSignalUnsafeCalls(
+    "asan-detect-signal-unsafe-calls",
+    cl::desc("Instrument calls to non-async-signal-safe functions to detect "
+             "unsafe calls inside signal handlers"),
+    cl::Hidden, cl::init(false));
+
+static cl::opt<bool> ClDetectSignalUnsafeGEPWrites(
+    "asan-detect-signal-unsafe-gep-writes",
+    cl::desc("Instrument stores through GEP (struct/array) pointers to detect "
+             "unsafe writes inside signal handlers"),
+    cl::Hidden, cl::init(false));
+
+// ponytail: linear scan of ~45 entries, switch to StringSet if list grows past ~100.
+static bool isAsyncSignalUnsafe(StringRef Name) {
+  static const StringRef UnsafeFuncs[] = {
+      // Memory allocation
+      "malloc", "free", "calloc", "realloc", "posix_memalign",
+      "aligned_alloc", "valloc", "pvalloc", "memalign",
+      // C++ allocation
+      "_Znwm", "_Znam", "_ZdlPv", "_ZdaPv",  // new, new[], delete, delete[]
+      // Formatted I/O
+      "printf", "fprintf", "sprintf", "snprintf", "vprintf", "vfprintf",
+      "vsprintf", "vsnprintf", "puts", "fputs", "putchar", "fputc",
+      "perror",
+      // File I/O
+      "fopen", "fclose", "fread", "fwrite", "fflush", "fseek",
+      "fgets", "getchar", "getc", "ungetc",
+      // String (may allocate or use locale)
+      "strerror", "strsignal",
+      // Syslog
+      "syslog", "vsyslog", "openlog", "closelog",
+      // Exit
+      "exit", "atexit",
+      // Locale
+      "setlocale",
+      // Time (some)
+      "localtime", "gmtime", "ctime", "asctime",
+  };
+  for (const auto &F : UnsafeFuncs)
+    if (Name == F)
+      return true;
+  return false;
+}
+
 STATISTIC(NumInstrumentedReads, "Number of instrumented reads");
 STATISTIC(NumInstrumentedWrites, "Number of instrumented writes");
 STATISTIC(NumOptimizedAccessesToGlobalVar,
@@ -953,6 +1003,11 @@ private:
   FunctionCallee AMDGPUAddressPrivate;
   int InstrumentationWithCallsThreshold;
   uint32_t MaxInlinePoisoningSize;
+
+  // Signal safety candidate collection.
+  FunctionCallee AsanSignalCandidateWrite;
+  GlobalVariable *AsanSignalHandlerRegistered = nullptr;
+  FunctionCallee AsanSignalCandidateCall;
 };
 
 class ModuleAddressSanitizer {
@@ -1838,6 +1893,36 @@ void AddressSanitizer::instrumentMop(ObjectSizeOffsetVisitor &ObjSizeVis,
     NumInstrumentedWrites++;
   else
     NumInstrumentedReads++;
+
+  // Signal safety candidate: wide writes (>8 bytes non-atomic) or GEP writes.
+  if (O.IsWrite && (ClDetectSignalUnsafeWrites || ClDetectSignalUnsafeGEPWrites)) {
+    if (auto *SI = dyn_cast<StoreInst>(O.getInsn())) {
+      uint64_t StoreBytes =
+          DL.getTypeStoreSize(SI->getValueOperand()->getType())
+              .getFixedValue();
+      bool IsWideWrite = ClDetectSignalUnsafeWrites &&
+                         !SI->isAtomic() && StoreBytes > 8;
+      bool IsGEPWrite = ClDetectSignalUnsafeGEPWrites &&
+                        isa<GetElementPtrInst>(SI->getPointerOperand()) &&
+                        !IsWideWrite;  // Skip if already caught above.
+      if (IsWideWrite || IsGEPWrite) {
+        IRBuilder<> IRB(O.getInsn());
+        Value *Registered = IRB.CreateLoad(IRB.getInt32Ty(),
+                                           AsanSignalHandlerRegistered,
+                                           "asan.signal.registered");
+        Value *HasHandler = IRB.CreateICmpNE(
+            Registered, ConstantInt::get(IRB.getInt32Ty(), 0));
+        Instruction *CheckTerm = SplitBlockAndInsertIfThen(
+            HasHandler, O.getInsn(), false,
+            MDBuilder(*C).createUnlikelyBranchWeights());
+        IRBuilder<> CheckIRB(CheckTerm);
+        Value *AddrLong = CheckIRB.CreatePtrToInt(Addr, IntptrTy);
+        Value *SizeVal = ConstantInt::get(IntptrTy, StoreBytes);
+        RTCI.createRuntimeCall(CheckIRB, AsanSignalCandidateWrite,
+                               {AddrLong, SizeVal});
+      }
+    }
+  }
 
   if (O.MaybeByteOffset) {
     Type *Ty = Type::getInt8Ty(*C);
@@ -2975,6 +3060,22 @@ void AddressSanitizer::initializeCallbacks(const TargetLibraryInfo *TLI) {
       Inserter.insertFunction(kAMDGPUAddressSharedName, IRB.getInt1Ty(), PtrTy);
   AMDGPUAddressPrivate = Inserter.insertFunction(kAMDGPUAddressPrivateName,
                                                  IRB.getInt1Ty(), PtrTy);
+
+  if (ClDetectSignalUnsafeWrites || ClDetectSignalUnsafeGEPWrites ||
+      ClDetectSignalUnsafeCalls) {
+    AsanSignalHandlerRegistered = M.getOrInsertGlobal(
+        "__asan_signal_handler_registered", IRB.getInt32Ty(), [&] {
+          return new GlobalVariable(
+              M, IRB.getInt32Ty(), false, GlobalVariable::ExternalLinkage,
+              nullptr, "__asan_signal_handler_registered");
+        });
+  }
+  if (ClDetectSignalUnsafeWrites || ClDetectSignalUnsafeGEPWrites)
+    AsanSignalCandidateWrite = Inserter.insertFunction(
+        "__asan_signal_candidate_write", IRB.getVoidTy(), IntptrTy, IntptrTy);
+  if (ClDetectSignalUnsafeCalls)
+    AsanSignalCandidateCall = Inserter.insertFunction(
+        "__asan_signal_candidate_call", IRB.getVoidTy(), IRB.getPtrTy());
 }
 
 bool AddressSanitizer::maybeInsertAsanInitAtFunctionEntry(Function &F) {
@@ -3121,6 +3222,7 @@ bool AddressSanitizer::instrumentFunction(Function &F,
   SmallVector<Instruction *, 8> NoReturnCalls;
   SmallVector<BasicBlock *, 16> AllBlocks;
   SmallVector<Instruction *, 16> PointerComparisonsOrSubtracts;
+  SmallVector<CallInst *, 16> UnsafeCallsToInstrument;
 
   // Fill the set of memory operations to instrument.
   for (auto &BB : F) {
@@ -3132,6 +3234,17 @@ bool AddressSanitizer::instrumentFunction(Function &F,
       // Skip instructions inserted by another instrumentation.
       if (Inst.hasMetadata(LLVMContext::MD_nosanitize))
         continue;
+      // Collect calls to async-signal-unsafe functions (independent of
+      // memory operand analysis).
+      if (ClDetectSignalUnsafeCalls) {
+        if (auto *CI = dyn_cast<CallInst>(&Inst)) {
+          if (Function *Callee = CI->getCalledFunction()) {
+            if (isAsyncSignalUnsafe(Callee->getName()))
+              UnsafeCallsToInstrument.push_back(CI);
+          }
+        }
+      }
+
       SmallVector<InterestingMemoryOperand, 1> InterestingOperands;
       getInterestingMemoryOperands(&Inst, InterestingOperands, TTI);
 
@@ -3193,6 +3306,25 @@ bool AddressSanitizer::instrumentFunction(Function &F,
   for (auto *Inst : IntrinToInstrument) {
     if (!suppressInstrumentationSiteForDebug(NumInstrumented))
       instrumentMemIntrinsic(Inst, RTCI);
+    FunctionModified = true;
+  }
+
+  // Instrument calls to async-signal-unsafe functions.
+  for (auto *CI : UnsafeCallsToInstrument) {
+    IRBuilder<> IRB(CI);
+    Value *Registered = IRB.CreateLoad(IRB.getInt32Ty(),
+                                       AsanSignalHandlerRegistered,
+                                       "asan.signal.registered");
+    Value *HasHandler =
+        IRB.CreateICmpNE(Registered, ConstantInt::get(IRB.getInt32Ty(), 0));
+    Instruction *CheckTerm = SplitBlockAndInsertIfThen(
+        HasHandler, CI, false,
+        MDBuilder(*C).createUnlikelyBranchWeights());
+    IRBuilder<> CheckIRB(CheckTerm);
+    Function *Callee = CI->getCalledFunction();
+    Value *FuncName = CheckIRB.CreateGlobalString(Callee->getName(),
+                                                  "asan.unsafe.func.name");
+    RTCI.createRuntimeCall(CheckIRB, AsanSignalCandidateCall, {FuncName});
     FunctionModified = true;
   }
 

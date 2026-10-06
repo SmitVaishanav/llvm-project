@@ -1,0 +1,27 @@
+#!/bin/bash
+# AsyncSan compile wrapper for oss-fuzz.
+#
+# Drop-in replacement for oss-fuzz's /usr/local/bin/compile script.
+# Appends AsyncSan instrumentation flags to CFLAGS/CXXFLAGS before
+# invoking the project's build.sh.
+#
+# Install: copy to /usr/local/bin/compile in the Docker image,
+# or source this before running build.sh.
+
+# AsyncSan compile-time flags (instrumentation pass)
+ASYNCSAN_FLAGS="${ASYNCSAN_FLAGS:--mllvm -asan-detect-signal-unsafe-calls -mllvm -asan-detect-signal-unsafe-writes -mllvm -asan-detect-signal-unsafe-gep-writes}"
+
+# Only inject when building with address sanitizer
+if [[ "${SANITIZER:-address}" == "address" ]]; then
+    export CFLAGS="${CFLAGS:-} ${ASYNCSAN_FLAGS}"
+    export CXXFLAGS="${CXXFLAGS:-} ${ASYNCSAN_FLAGS}"
+    echo "[AsyncSan] Injected signal-safety flags into CFLAGS/CXXFLAGS"
+fi
+
+# AsyncSan runtime flags (candidate collection + report)
+export ASYNCSAN_ASAN_OPTIONS="detect_signal_unsafe_writes=1"
+
+# If called as a script (not sourced), exec the original compile
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    exec /usr/local/bin/compile.orig "$@"
+fi

@@ -26,6 +26,7 @@
 #include "asan_thread.h"
 #include "lsan/lsan_common.h"
 #include "sanitizer_common/sanitizer_atomic.h"
+#include "sanitizer_common/sanitizer_file.h"
 #include "sanitizer_common/sanitizer_flags.h"
 #include "sanitizer_common/sanitizer_interface_internal.h"
 #include "sanitizer_common/sanitizer_libc.h"
@@ -309,6 +310,8 @@ static NOINLINE void force_interface_symbols() {
     case 50: __asan_set_shadow_f3(0, 0); break;
     case 51: __asan_set_shadow_f5(0, 0); break;
     case 52: __asan_set_shadow_f8(0, 0); break;
+    case 53: __asan_signal_candidate_write(0, 0); break;
+    case 54: __asan_signal_candidate_call(nullptr); break;
   }
   // clang-format on
 }
@@ -517,6 +520,9 @@ static bool AsanInitInternal() {
   if (flags()->atexit)
     Atexit(asan_atexit);
 
+  if (flags()->detect_signal_unsafe_writes)
+    Atexit(__asan::FlushSignalSafetyReport);
+
   InitializeCoverage(common_flags()->coverage, common_flags()->coverage_dir);
 
   // Now that ASan runtime is (mostly) initialized, deactivate it if
@@ -682,4 +688,401 @@ void __asan_init() {
 
 void __asan_version_mismatch_check() {
   // Do nothing.
+}
+
+extern "C" SANITIZER_INTERFACE_ATTRIBUTE THREADLOCAL u32
+    __asan_in_signal_handler = 0;
+
+extern "C" SANITIZER_INTERFACE_ATTRIBUTE u32
+    __asan_signal_handler_registered = 0;
+
+namespace __asan {
+
+// ============= Signal Safety Candidate Collection =============
+
+enum SignalCandidateType : u8 {
+  kCandidateWrite = 0,
+  kCandidateCall = 1,
+};
+
+struct SignalCandidate {
+  uptr pc;
+  uptr addr;
+  uptr size;
+  const char *func_name;
+  SignalCandidateType type;
+  bool in_signal_handler;
+  atomic_uint8_t ready;  // Set last after all fields written (release).
+};
+
+static const uptr kMaxSignalCandidates = 4096;
+static SignalCandidate signal_candidates[kMaxSignalCandidates];
+static atomic_uint32_t signal_candidate_count = {0};
+
+// ponytail: open-addressing dedup, >50% load if all 4096 candidates used.
+// Upgrade to larger table if collisions become measurable.
+static const uptr kDedupSlots = 2048;
+static atomic_uintptr_t dedup_table[kDedupSlots];
+
+static bool DedupCheck(uptr pc, bool in_handler) {
+  uptr key = pc ^ ((uptr)in_handler << 63);
+  if (key == 0) key = 1;  // Reserve 0 as empty sentinel
+  uptr slot = (key * 2654435761ULL) % kDedupSlots;
+  for (uptr i = 0; i < 4; i++) {
+    uptr idx = (slot + i) % kDedupSlots;
+    uptr existing = atomic_load(&dedup_table[idx], memory_order_relaxed);
+    if (existing == key) return true;
+    if (existing == 0) {
+      uptr expected = 0;
+      if (atomic_compare_exchange_strong(&dedup_table[idx], &expected, key,
+                                          memory_order_relaxed))
+        return false;
+      if (expected == key) return true;
+    }
+  }
+  return false;
+}
+
+static void RecordCandidate(SignalCandidateType type, uptr pc, uptr addr,
+                             uptr size, const char *func_name,
+                             bool in_handler) {
+  if (DedupCheck(pc, in_handler)) return;
+  u32 idx = atomic_fetch_add(&signal_candidate_count, 1, memory_order_relaxed);
+  if (idx >= kMaxSignalCandidates) return;
+  signal_candidates[idx].type = type;
+  signal_candidates[idx].pc = pc;
+  signal_candidates[idx].addr = addr;
+  signal_candidates[idx].size = size;
+  signal_candidates[idx].func_name = func_name;
+  signal_candidates[idx].in_signal_handler = in_handler;
+  // Publish: all fields visible before reader sees ready=1.
+  atomic_store(&signal_candidates[idx].ready, 1, memory_order_release);
+}
+
+static u32 HashString(const char *s) {
+  u32 h = 5381;
+  for (; *s; s++)
+    h = h * 33 + (u32)*s;
+  return h;
+}
+
+__sanitizer_sigaction user_signal_actions[64];
+
+void FlushSignalSafetyReport() {
+  static atomic_uint32_t already_flushed = {0};
+  if (atomic_exchange(&already_flushed, 1, memory_order_relaxed))
+    return;
+
+  u32 count = atomic_load(&signal_candidate_count, memory_order_relaxed);
+  if (count == 0) return;
+  if (count > kMaxSignalCandidates) count = kMaxSignalCandidates;
+
+  // Separate into main-thread and signal-handler sets.
+  // Only count entries where ready==1 (acquire pairs with release in writer).
+  u32 main_count = 0, handler_count = 0;
+  for (u32 i = 0; i < count; i++) {
+    if (!atomic_load(&signal_candidates[i].ready, memory_order_acquire))
+      continue;
+    if (signal_candidates[i].in_signal_handler)
+      handler_count++;
+    else
+      main_count++;
+  }
+
+  Printf("\n");
+  Printf(
+      "=================================================================\n");
+  Printf("AddressSanitizer Signal Safety Analysis Report\n");
+  Printf(
+      "=================================================================\n");
+
+  // Print main-thread candidates
+  Printf("\nMain-thread candidates (%u total):\n", main_count);
+  for (u32 i = 0; i < count; i++) {
+    if (!atomic_load(&signal_candidates[i].ready, memory_order_acquire))
+      continue;
+    if (signal_candidates[i].in_signal_handler) continue;
+    auto &c = signal_candidates[i];
+    if (c.type == kCandidateWrite) {
+      Printf("  [W] write %zu bytes at %p (PC: %p)\n",
+             (uptr)c.size, (void *)c.addr, (void *)c.pc);
+    } else {
+      Printf("  [C] call to '%s' (PC: %p)\n", c.func_name, (void *)c.pc);
+    }
+  }
+
+  // Print signal-handler candidates
+  Printf("\nSignal-handler candidates (%u total):\n", handler_count);
+  for (u32 i = 0; i < count; i++) {
+    if (!atomic_load(&signal_candidates[i].ready, memory_order_acquire))
+      continue;
+    if (!signal_candidates[i].in_signal_handler) continue;
+    auto &c = signal_candidates[i];
+    if (c.type == kCandidateWrite) {
+      Printf("  [W] write %zu bytes at %p (PC: %p)\n",
+             (uptr)c.size, (void *)c.addr, (void *)c.pc);
+    } else {
+      Printf("  [C] call to '%s' (PC: %p)\n", c.func_name, (void *)c.pc);
+    }
+  }
+
+  // ===== Matchmaking: O(n) calls (hash), O(n log n) writes (sort+bsearch) =====
+  struct Match { u32 main_idx; u32 handler_idx; bool is_write; };
+  // ponytail: 256-match cap. Hash for calls, heapsort+bsearch for writes.
+  static const u32 kMaxMatches = 256;
+  Match matches[kMaxMatches];
+  u32 match_count = 0;
+
+  // --- Call matching via hash table ---
+  static const u32 kCallHashSlots = 256;
+  u32 call_hash[kCallHashSlots];
+  internal_memset(call_hash, 0xFF, sizeof(call_hash));
+
+  for (u32 i = 0; i < count; i++) {
+    if (!atomic_load(&signal_candidates[i].ready, memory_order_acquire))
+      continue;
+    auto &c = signal_candidates[i];
+    if (c.in_signal_handler || c.type != kCandidateCall || !c.func_name)
+      continue;
+    u32 slot = HashString(c.func_name) % kCallHashSlots;
+    for (u32 p = 0; p < 8; p++) {
+      u32 idx = (slot + p) % kCallHashSlots;
+      if (call_hash[idx] == 0xFFFFFFFF) { call_hash[idx] = i; break; }
+    }
+  }
+
+  for (u32 j = 0; j < count && match_count < kMaxMatches; j++) {
+    if (!atomic_load(&signal_candidates[j].ready, memory_order_acquire))
+      continue;
+    auto &c = signal_candidates[j];
+    if (!c.in_signal_handler || c.type != kCandidateCall || !c.func_name)
+      continue;
+    u32 slot = HashString(c.func_name) % kCallHashSlots;
+    for (u32 p = 0; p < 8; p++) {
+      u32 idx = (slot + p) % kCallHashSlots;
+      if (call_hash[idx] == 0xFFFFFFFF) break;
+      u32 i = call_hash[idx];
+      if (internal_strcmp(signal_candidates[i].func_name, c.func_name) == 0) {
+        matches[match_count++] = {i, j, false};
+        break;
+      }
+    }
+  }
+
+  // --- Write matching via sort + binary search ---
+  u32 main_writes[kMaxSignalCandidates];
+  u32 mw_count = 0;
+  for (u32 i = 0; i < count; i++) {
+    if (!atomic_load(&signal_candidates[i].ready, memory_order_acquire))
+      continue;
+    if (!signal_candidates[i].in_signal_handler &&
+        signal_candidates[i].type == kCandidateWrite)
+      main_writes[mw_count++] = i;
+  }
+
+  struct WriteAddrLess {
+    bool operator()(const u32 &a, const u32 &b) const {
+      return signal_candidates[a].addr < signal_candidates[b].addr;
+    }
+  };
+  Sort(main_writes, (uptr)mw_count, WriteAddrLess());
+
+  for (u32 j = 0; j < count && match_count < kMaxMatches; j++) {
+    if (!atomic_load(&signal_candidates[j].ready, memory_order_acquire))
+      continue;
+    auto &hc = signal_candidates[j];
+    if (!hc.in_signal_handler || hc.type != kCandidateWrite) continue;
+    uptr h_end = hc.addr + hc.size;
+    // Binary search: first main write with addr >= h_end
+    u32 lo = 0, hi = mw_count;
+    while (lo < hi) {
+      u32 mid = lo + (hi - lo) / 2;
+      if (signal_candidates[main_writes[mid]].addr < h_end)
+        lo = mid + 1;
+      else
+        hi = mid;
+    }
+    // All at [0, lo) have addr < h_end; scan backward for overlap
+    for (u32 k = lo; k > 0 && match_count < kMaxMatches; k--) {
+      auto &mc = signal_candidates[main_writes[k - 1]];
+      if (mc.addr + mc.size <= hc.addr) break;
+      matches[match_count++] = {main_writes[k - 1], j, true};
+    }
+  }
+
+  Printf("\n");
+  Printf(
+      "=================================================================\n");
+  Printf("Matched signal-safety violations:\n");
+  Printf(
+      "=================================================================\n");
+
+  for (u32 k = 0; k < match_count; k++) {
+    auto &mc = signal_candidates[matches[k].main_idx];
+    auto &sc = signal_candidates[matches[k].handler_idx];
+    if (matches[k].is_write) {
+      Printf("\n  Match #%u: WRITE to overlapping address range\n", k + 1);
+      Printf("    Main:   write %zu bytes at %p (PC: %p)\n",
+             (uptr)mc.size, (void *)mc.addr, (void *)mc.pc);
+      Printf("    Signal: write %zu bytes at %p (PC: %p)\n",
+             (uptr)sc.size, (void *)sc.addr, (void *)sc.pc);
+    } else {
+      Printf("\n  Match #%u: CALL to same function '%s'\n",
+             k + 1, mc.func_name);
+      Printf("    Main:   PC: %p\n", (void *)mc.pc);
+      Printf("    Signal: PC: %p\n", (void *)sc.pc);
+    }
+  }
+
+  if (match_count == 0) {
+    Printf("\n  No matches found between main-thread and signal-handler "
+           "candidates.\n");
+  }
+
+  // ===== LLDB Script Generation (orchestrated) =====
+  if (match_count > 0) {
+    // Find first registered signal for orchestration
+    int sig = -1;
+    for (int s = 1; s < 64; s++) {
+      if ((uptr)user_signal_actions[s].handler > 1) {
+        sig = s;
+        break;
+      }
+    }
+
+    const char *lldb_path = "asan_signal_safety.lldb";
+    fd_t fd = __sanitizer::OpenFile(lldb_path, __sanitizer::WrOnly);
+    if (fd != kInvalidFd) {
+      char buf[512];
+      internal_snprintf(buf, sizeof(buf),
+          "# ASan Signal Safety LLDB Script\n"
+          "# Orchestrates deterministic reproduction of signal-safety races\n"
+          "# Usage: lldb -s %s -- ./your_program\n\n", lldb_path);
+      __sanitizer::WriteToFile(fd, buf, internal_strlen(buf));
+
+      if (sig > 0) {
+        internal_snprintf(buf, sizeof(buf),
+            "process handle %d -s false -n true -p true\n\n", sig);
+        __sanitizer::WriteToFile(fd, buf, internal_strlen(buf));
+      }
+
+      u32 bp_num = 1;
+      for (u32 k = 0; k < match_count; k++) {
+        auto &mc = signal_candidates[matches[k].main_idx];
+        auto &sc = signal_candidates[matches[k].handler_idx];
+        if (matches[k].is_write) {
+          internal_snprintf(buf, sizeof(buf),
+              "# Match #%u: WRITE overlap at %p (%zu bytes)\n",
+              k + 1, (void *)mc.addr, (uptr)mc.size);
+          __sanitizer::WriteToFile(fd, buf, internal_strlen(buf));
+
+          // Main write: one-shot, dump memory, deliver signal
+          internal_snprintf(buf, sizeof(buf),
+              "breakpoint set --address %p --one-shot true\n"
+              "breakpoint command add %u\n",
+              (void *)mc.pc, bp_num);
+          __sanitizer::WriteToFile(fd, buf, internal_strlen(buf));
+          internal_snprintf(buf, sizeof(buf),
+              "  script print(\"\\n=== MAIN WRITE: %zu bytes at %p ===\")\n"
+              "  memory read %p -c %zu -f x\n",
+              (uptr)mc.size, (void *)mc.addr,
+              (void *)mc.addr, (uptr)mc.size);
+          __sanitizer::WriteToFile(fd, buf, internal_strlen(buf));
+          if (sig > 0) {
+            internal_snprintf(buf, sizeof(buf),
+                "  process signal %d\n", sig);
+            __sanitizer::WriteToFile(fd, buf, internal_strlen(buf));
+          }
+          internal_snprintf(buf, sizeof(buf), "DONE\n\n");
+          __sanitizer::WriteToFile(fd, buf, internal_strlen(buf));
+          bp_num++;
+
+          // Handler write: one-shot, dump memory, continue
+          internal_snprintf(buf, sizeof(buf),
+              "breakpoint set --address %p --one-shot true\n"
+              "breakpoint command add %u\n",
+              (void *)sc.pc, bp_num);
+          __sanitizer::WriteToFile(fd, buf, internal_strlen(buf));
+          internal_snprintf(buf, sizeof(buf),
+              "  script print(\"\\n=== HANDLER WRITE: "
+              "%zu bytes at %p (RACE!) ===\")\n"
+              "  memory read %p -c %zu -f x\n"
+              "  continue\nDONE\n\n",
+              (uptr)sc.size, (void *)sc.addr,
+              (void *)sc.addr, (uptr)sc.size);
+          __sanitizer::WriteToFile(fd, buf, internal_strlen(buf));
+          bp_num++;
+        } else {
+          internal_snprintf(buf, sizeof(buf),
+              "# Match #%u: Reentrant call to '%s'\n", k + 1, mc.func_name);
+          __sanitizer::WriteToFile(fd, buf, internal_strlen(buf));
+
+          internal_snprintf(buf, sizeof(buf),
+              "breakpoint set --address %p --one-shot true\n"
+              "breakpoint command add %u\n"
+              "  script print(\"\\n=== MAIN calls %s ===\")\n"
+              "  thread backtrace -c 5\n"
+              "  continue\nDONE\n\n",
+              (void *)mc.pc, bp_num, mc.func_name);
+          __sanitizer::WriteToFile(fd, buf, internal_strlen(buf));
+          bp_num++;
+
+          internal_snprintf(buf, sizeof(buf),
+              "breakpoint set --address %p --one-shot true\n"
+              "breakpoint command add %u\n"
+              "  script print(\"\\n=== HANDLER calls "
+              "%s (REENTRANT!) ===\")\n"
+              "  thread backtrace -c 5\n"
+              "  continue\nDONE\n\n",
+              (void *)sc.pc, bp_num, sc.func_name);
+          __sanitizer::WriteToFile(fd, buf, internal_strlen(buf));
+          bp_num++;
+        }
+      }
+
+      internal_snprintf(buf, sizeof(buf), "run\n");
+      __sanitizer::WriteToFile(fd, buf, internal_strlen(buf));
+      __sanitizer::CloseFile(fd);
+      Printf("\nLLDB script written to: %s\n", lldb_path);
+    }
+  }
+
+  Printf(
+      "=================================================================\n");
+}
+
+void asan_signal_trampoline(int sig, __sanitizer_siginfo *info, void *ctx) {
+  __asan_in_signal_handler++;
+  auto handler = user_signal_actions[sig].sigaction;
+  if (handler)
+    handler(sig, info, ctx);
+  __asan_in_signal_handler--;
+}
+
+void asan_signal_trampoline_handler(int sig) {
+  __asan_in_signal_handler++;
+  auto handler = user_signal_actions[sig].handler;
+  if (handler)
+    handler(sig);
+  __asan_in_signal_handler--;
+}
+
+}  // namespace __asan
+
+extern "C" NOINLINE INTERFACE_ATTRIBUTE
+void __asan_signal_candidate_write(uptr addr, uptr size) {
+  if (!__asan_signal_handler_registered) return;
+  uptr pc = (uptr)__builtin_return_address(0);
+  bool in_handler = (__asan_in_signal_handler != 0);
+  __asan::RecordCandidate(__asan::kCandidateWrite, pc, addr, size,
+                           nullptr, in_handler);
+}
+
+extern "C" NOINLINE INTERFACE_ATTRIBUTE
+void __asan_signal_candidate_call(const char *func_name) {
+  if (!__asan_signal_handler_registered) return;
+  uptr pc = (uptr)__builtin_return_address(0);
+  bool in_handler = (__asan_in_signal_handler != 0);
+  __asan::RecordCandidate(__asan::kCandidateCall, pc, 0, 0,
+                           func_name, in_handler);
 }

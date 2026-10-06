@@ -158,6 +158,10 @@ const int kAsanAllocaRightMagic = 0xcb;
 static const uptr kCurrentStackFrameMagic = 0x41B58AB3;
 static const uptr kRetiredStackFrameMagic = 0x45E0360E;
 
+// Flush the signal-safety analysis report (called from atexit and
+// interceptors for _exit/_Exit/abort).
+void FlushSignalSafetyReport();
+
 }  // namespace __asan
 
 #endif  // ASAN_INTERNAL_H

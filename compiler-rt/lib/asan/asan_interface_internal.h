@@ -282,6 +282,23 @@ extern "C" {
 
   SANITIZER_INTERFACE_ATTRIBUTE int __asan_update_allocation_context(
       void *addr);
+
+  // Signal handler depth counter — used by trampoline to track context.
+  SANITIZER_INTERFACE_ATTRIBUTE extern __thread u32 __asan_in_signal_handler;
+
+  // Non-zero after first signal handler registration via sigaction/signal.
+  // Used by instrumented code to gate candidate collection.
+  // Benign race: aligned u32 store/load is naturally atomic on x86/ARM.
+  // Same pattern as ASan's __asan_option_detect_stack_use_after_return.
+  SANITIZER_INTERFACE_ATTRIBUTE extern u32 __asan_signal_handler_registered;
+
+  // Record a write candidate for signal safety analysis.
+  SANITIZER_INTERFACE_ATTRIBUTE
+  void __asan_signal_candidate_write(uptr addr, uptr size);
+
+  // Record a call candidate for signal safety analysis.
+  SANITIZER_INTERFACE_ATTRIBUTE
+  void __asan_signal_candidate_call(const char *func_name);
 }  // extern "C"
 
 #endif  // ASAN_INTERFACE_INTERNAL_H
