@@ -334,21 +334,51 @@ def find_reg_calls_fast(proj):
     return calls, wrappers
 
 
+_CALLER_SAVED_X86 = frozenset({
+    'rax', 'eax', 'rcx', 'ecx', 'rdx', 'edx',
+    'rsi', 'esi', 'rdi', 'edi',
+    'r8', 'r8d', 'r9', 'r9d', 'r10', 'r10d', 'r11', 'r11d',
+})
+
+
 def _extract_arg_from_preceding(preceding, target_reg, func_syms):
     """Scan backward through preceding instructions to find a function address
-    loaded into target_reg. Follows register chains (mov rsi, rbx → trace rbx)."""
+    loaded into target_reg. Follows register chains (mov rsi, rbx → trace rbx).
+
+    Key rules for x86-64:
+    - mov dst, src_reg: replace dst with src in tracking set
+    - lea dst, [rip+off]: resolve and return
+    - call: clobbers caller-saved regs (rax,rcx,rdx,rsi,rdi,r8-r11)
+    - xor reg, reg: sets to 0 (SIG_DFL), dead end
+    """
     regs_to_check = {target_reg}
     for j in range(len(preceding) - 1, -1, -1):
         p = preceding[j]
+        # call clobbers caller-saved regs — remove them from tracking
+        if p.mnemonic in ('call', 'callq', 'bl'):
+            clobbered = regs_to_check & _CALLER_SAVED_X86
+            regs_to_check -= clobbered
+            if not regs_to_check:
+                return None
+            continue
         if len(p.operands) < 2:
             continue
-        dst = p.reg_name(p.operands[0].reg) if p.operands[0].type == 1 else None
+        if p.operands[0].type != 1:  # dst must be register
+            continue
+        dst = p.reg_name(p.operands[0].reg)
         if dst not in regs_to_check:
             continue
         if p.mnemonic == 'adrp':
             return _resolve_adrp_add(preceding, j)
         if p.mnemonic == 'adr':
             return p.operands[1].imm
+        if p.mnemonic == 'xor' and p.operands[1].type == 1:
+            src = p.reg_name(p.operands[1].reg)
+            if src == dst:  # xor reg, reg = 0 (SIG_DFL)
+                regs_to_check.discard(dst)
+                if not regs_to_check:
+                    return None
+                continue
         if p.mnemonic in ('lea', 'mov'):
             op1 = p.operands[1]
             if op1.type == 3:  # MEM (x86-64 RIP-relative lea)
@@ -356,12 +386,10 @@ def _extract_arg_from_preceding(preceding, target_reg, func_syms):
                 if base == 'rip':
                     return p.address + p.size + op1.mem.disp
             elif op1.type == 1:  # REG — follow the chain
+                regs_to_check.discard(dst)
                 regs_to_check.add(p.reg_name(op1.reg))
             elif hasattr(op1, 'imm'):
                 return op1.imm
-        if p.mnemonic == 'xor' and p.operands[1].type == 1:
-            # xor reg, reg = 0 (SIG_DFL), stop searching this chain
-            regs_to_check.discard(dst)
     return None
 
 
@@ -395,7 +423,21 @@ def _find_wrapper_callers(proj, wrapper_addr, wrapper_name,
             continue
 
         # Found a call to the wrapper. Extract 2nd arg (handler).
-        preceding = insns[max(0, i - 30):i]
+        # Scan from enclosing function start (not just 30 insns) to catch
+        # handlers loaded into callee-saved registers (rbx, r12-r15) early.
+        func_addr, _ = _find_enclosing_function(
+            insn.address, func_starts, func_syms
+        )
+        if func_addr:
+            # Find instruction index of function start
+            func_start_idx = i
+            for k in range(i - 1, max(0, i - 2000), -1):
+                if insns[k].address <= func_addr:
+                    func_start_idx = k
+                    break
+            preceding = insns[func_start_idx:i]
+        else:
+            preceding = insns[max(0, i - 200):i]
         handler_addr = _extract_arg_from_preceding(preceding, target_reg, func_syms)
         if handler_addr and handler_addr in func_syms:
             hname = func_syms[handler_addr]
