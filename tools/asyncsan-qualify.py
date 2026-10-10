@@ -133,7 +133,8 @@ def _get_function_symbols(proj):
     """Get function symbol table: addr → name.
 
     Includes non-function symbols in the text range since Mach-O local
-    symbols often lack the function type flag.
+    symbols often lack the function type flag. For stripped x86-64 ELF
+    binaries, uses endbr64 instructions as function-start heuristic.
     """
     text_start, text_end = _get_text_range(proj)
     syms = {}
@@ -145,6 +146,17 @@ def _get_function_symbols(proj):
         # Include if marked as function OR if it falls in the text section
         if sym.is_function or text_start <= sym.rebased_addr < text_end:
             syms[sym.rebased_addr] = _strip_underscore(sym.name)
+
+    # For stripped x86-64 binaries, detect function starts via endbr64
+    text_func_count = sum(1 for a in syms if text_start <= a < text_end)
+    if text_func_count < 20 and isinstance(proj.arch, archinfo.ArchAMD64):
+        from capstone import Cs, CS_ARCH_X86, CS_MODE_64
+        cs = Cs(CS_ARCH_X86, CS_MODE_64)
+        data = proj.loader.memory.load(text_start, text_end - text_start)
+        for insn in cs.disasm(data, text_start):
+            if insn.mnemonic == 'endbr64' and insn.address not in syms:
+                syms[insn.address] = f"sub_{insn.address:x}"
+
     return syms
 
 
@@ -294,9 +306,21 @@ def find_reg_calls_fast(proj):
             "all_insns": insns,
         })
 
-        # Record as potential wrapper
+        # Record as potential wrapper — even without symbol, use call addr
+        # to backward-scan for the function prologue (endbr64 / push rbp)
         if caller_addr is not None:
             wrapper_callers[caller_addr] = caller_name or f"sub_{caller_addr:x}"
+        else:
+            # Stripped binary fallback: scan backward for function prologue
+            for j in range(i - 1, max(0, i - 500), -1):
+                if insns[j].mnemonic in ('endbr64', 'endbr32'):
+                    wrapper_callers[insns[j].address] = f"sub_{insns[j].address:x}"
+                    break
+                if insns[j].mnemonic == 'ret':
+                    # Likely start of function is next instruction
+                    if j + 1 < len(insns):
+                        wrapper_callers[insns[j+1].address] = f"sub_{insns[j+1].address:x}"
+                    break
 
     # Auto-detect wrappers: find all callers of each wrapper function
     # and extract handler args from them
@@ -312,21 +336,32 @@ def find_reg_calls_fast(proj):
 
 def _extract_arg_from_preceding(preceding, target_reg, func_syms):
     """Scan backward through preceding instructions to find a function address
-    loaded into target_reg. Returns the address or None."""
+    loaded into target_reg. Follows register chains (mov rsi, rbx → trace rbx)."""
+    regs_to_check = {target_reg}
     for j in range(len(preceding) - 1, -1, -1):
         p = preceding[j]
-        if p.mnemonic == 'adrp' and len(p.operands) >= 2:
-            dst = p.reg_name(p.operands[0].reg)
-            if dst == target_reg:
-                return _resolve_adrp_add(preceding, j)
-        if p.mnemonic == 'adr' and len(p.operands) >= 2:
-            dst = p.reg_name(p.operands[0].reg)
-            if dst == target_reg:
-                return p.operands[1].imm
-        if p.mnemonic in ('lea', 'mov') and len(p.operands) >= 2:
-            dst = p.reg_name(p.operands[0].reg)
-            if dst == target_reg and hasattr(p.operands[1], 'imm'):
-                return p.operands[1].imm
+        if len(p.operands) < 2:
+            continue
+        dst = p.reg_name(p.operands[0].reg) if p.operands[0].type == 1 else None
+        if dst not in regs_to_check:
+            continue
+        if p.mnemonic == 'adrp':
+            return _resolve_adrp_add(preceding, j)
+        if p.mnemonic == 'adr':
+            return p.operands[1].imm
+        if p.mnemonic in ('lea', 'mov'):
+            op1 = p.operands[1]
+            if op1.type == 3:  # MEM (x86-64 RIP-relative lea)
+                base = p.reg_name(op1.mem.base) if op1.mem.base else None
+                if base == 'rip':
+                    return p.address + p.size + op1.mem.disp
+            elif op1.type == 1:  # REG — follow the chain
+                regs_to_check.add(p.reg_name(op1.reg))
+            elif hasattr(op1, 'imm'):
+                return op1.imm
+        if p.mnemonic == 'xor' and p.operands[1].type == 1:
+            # xor reg, reg = 0 (SIG_DFL), stop searching this chain
+            regs_to_check.discard(dst)
     return None
 
 
@@ -389,13 +424,18 @@ def extract_handler(proj, call_info, func_syms, func_starts):
 
     if reg_fn == "sigaction":
         # sigaction: handler stored in struct. Scan preceding instructions
-        # for adrp+add pairs that resolve to known functions.
+        # for adrp+add pairs or lea [rip+off] that resolve to known functions.
         candidates = []
         for i, insn in enumerate(preceding):
             addr = _resolve_adrp_add(preceding, i)
             if addr is None and insn.mnemonic == 'lea' and len(insn.operands) >= 2:
-                if hasattr(insn.operands[1], 'imm'):
-                    addr = insn.operands[1].imm
+                op1 = insn.operands[1]
+                if op1.type == 3:  # MEM operand
+                    base = insn.reg_name(op1.mem.base) if op1.mem.base else None
+                    if base == 'rip':
+                        addr = insn.address + insn.size + op1.mem.disp
+                elif hasattr(op1, 'imm'):
+                    addr = op1.imm
             if addr is not None and addr in func_syms:
                 name = func_syms[addr]
                 if name not in _REG_BASE and name != call_info["caller_name"]:
