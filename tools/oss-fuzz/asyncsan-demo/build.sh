@@ -6,8 +6,13 @@ ASYNCSAN_FLAGS="-mllvm -asan-detect-signal-unsafe-calls -mllvm -asan-detect-sign
 # oss-fuzz passes -stdlib=libc++ but we didn't build it — use libstdc++
 FIXED_CXXFLAGS=$(echo "$CXXFLAGS" | sed 's/-stdlib=libc++//g')
 
+# oss-fuzz sets LIB_FUZZING_ENGINE to -fsanitize=fuzzer, which makes our
+# clang look for libclang_rt.fuzzer.a. Use pre-compiled lib instead.
+FUZZER_LIB="/usr/lib/libFuzzingEngine.a"
+
 # Build each fuzz target
 for src in $SRC/*.cpp; do
     name=$(basename "$src" .cpp)
-    $CXX $FIXED_CXXFLAGS $ASYNCSAN_FLAGS "$src" -o "$OUT/$name" $LIB_FUZZING_ENGINE -lstdc++
+    $CXX $FIXED_CXXFLAGS $ASYNCSAN_FLAGS -c "$src" -o "${name}.o"
+    $CXX $FIXED_CXXFLAGS "${name}.o" -o "$OUT/$name" "$FUZZER_LIB" -lstdc++ -lpthread -lrt -ldl
 done
