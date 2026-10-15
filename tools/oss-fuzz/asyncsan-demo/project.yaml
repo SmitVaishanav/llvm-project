@@ -1,0 +1,7 @@
+homepage: "https://github.com/SmitVaishanav/llvm-project"
+language: c++
+primary_contact: "svaishanav@stevens.edu"
+sanitizers:
+  - address
+architectures:
+  - x86_64
