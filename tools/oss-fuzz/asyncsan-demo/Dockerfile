@@ -16,8 +16,8 @@ RUN git clone --depth 1 https://github.com/SmitVaishanav/llvm-project.git /src/l
       -DLLVM_ENABLE_PER_TARGET_RUNTIME_DIR=ON && \
     ninja -C /src/llvm-build clang compiler-rt -j$(nproc)
 
-# Build ASan runtime (the 'compiler-rt' target only builds builtins)
-RUN ninja -C /src/llvm-build/runtimes/runtimes-bins asan -j$(nproc)
+# Build all sanitizer runtimes (the top-level 'compiler-rt' only builds builtins)
+RUN ninja -C /src/llvm-build/runtimes/runtimes-bins -j$(nproc)
 
 # Link runtime libs into clang's resource dir so clang finds them
 RUN CLANG_VER=$(/src/llvm-build/bin/clang --version | grep -oP 'clang version \K[0-9]+') && \
