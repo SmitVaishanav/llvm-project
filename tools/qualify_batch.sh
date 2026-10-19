@@ -3,7 +3,7 @@
 # Usage: bash tools/qualify_batch.sh
 # Requires: source ~/asyncsan-venv/bin/activate first
 
-QUALIFY="python3 ~/llvm-project/tools/asyncsan-qualify.py"
+SCRIPT="$HOME/llvm-project/tools/asyncsan-qualify.py"
 
 # Common signal-using binaries
 BINS=(
@@ -37,8 +37,8 @@ echo "=============================================="
 echo " AsyncSan Binary Qualification — Batch Report"
 echo "=============================================="
 echo ""
-printf "%-30s %-10s %-8s %-8s %s\n" "BINARY" "VERDICT" "HANDLERS" "WRAPPERS" "NOTES"
-printf "%-30s %-10s %-8s %-8s %s\n" "------" "-------" "--------" "--------" "-----"
+printf "%-30s %-12s %-8s %-8s %s\n" "BINARY" "VERDICT" "HANDLERS" "WRAPPERS" "WRAPPER NAMES"
+printf "%-30s %-12s %-8s %-8s %s\n" "------" "-------" "--------" "--------" "-------------"
 
 for bin in "${BINS[@]}"; do
     # Expand globs
@@ -46,21 +46,27 @@ for bin in "${BINS[@]}"; do
         [ -f "$resolved" ] || continue
         name=$(basename "$resolved")
 
-        # Run qualifier, capture output
-        output=$($QUALIFY "$resolved" 2>/dev/null)
+        # Run qualifier, capture stdout+stderr separately
+        output=$(python3 "$SCRIPT" "$resolved" 2>/dev/null)
+        rc=$?
 
-        # Parse results
-        verdict=$(echo "$output" | grep "VERDICT:" | sed 's/.*VERDICT: //')
-        handlers=$(echo "$output" | grep "Signal handlers found:" | grep -oP '\d+')
-        wrappers=$(echo "$output" | grep "Auto-detected" | grep -oP '\d+')
-        wrapper_names=$(echo "$output" | grep "Auto-detected" | sed 's/.*function(s): //')
+        # Parse results from output
+        handlers=$(echo "$output" | grep -oP 'Signal handlers found: \K\d+' || echo "0")
+        wrappers=$(echo "$output" | grep -oP 'Auto-detected \K\d+' || echo "0")
+        wrapper_names=$(echo "$output" | grep 'Auto-detected' | sed 's/.*function(s): //' || echo "")
 
-        [ -z "$handlers" ] && handlers="0"
-        [ -z "$wrappers" ] && wrappers="0"
-        [ -z "$verdict" ] && verdict="SKIP (no handlers)"
+        if echo "$output" | grep -q "FUZZ"; then
+            verdict="FUZZ"
+        elif echo "$output" | grep -q "INVESTIGATE"; then
+            verdict="INVESTIGATE"
+        elif [ "$handlers" != "0" ]; then
+            verdict="SKIP-TRIV"
+        else
+            verdict="SKIP"
+        fi
 
-        printf "%-30s %-10s %-8s %-8s %s\n" \
-            "$name" "${verdict%%(*}" "$handlers" "$wrappers" "$wrapper_names"
+        printf "%-30s %-12s %-8s %-8s %s\n" \
+            "$name" "$verdict" "$handlers" "$wrappers" "$wrapper_names"
     done
 done
 
