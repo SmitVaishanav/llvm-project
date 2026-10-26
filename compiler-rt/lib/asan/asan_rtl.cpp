@@ -38,6 +38,8 @@ uptr __asan_shadow_memory_dynamic_address;  // Global interface symbol.
 int __asan_option_detect_stack_use_after_return;  // Global interface symbol.
 uptr *__asan_test_only_reported_buggy_pointer;  // Used only for testing asan.
 
+static const char *signal_logdir;
+
 namespace __asan {
 
 uptr AsanMappingProfile[kAsanMappingProfileSize];
@@ -523,6 +525,8 @@ static bool AsanInitInternal() {
   if (flags()->detect_signal_unsafe_writes)
     Atexit(__asan::FlushSignalSafetyReport);
 
+  signal_logdir = GetEnv("ASAN_SIGNAL_LOGDIR");
+
   InitializeCoverage(common_flags()->coverage, common_flags()->coverage_dir);
 
   // Now that ASan runtime is (mostly) initialized, deactivate it if
@@ -767,6 +771,19 @@ static u32 HashString(const char *s) {
 }
 
 __sanitizer_sigaction user_signal_actions[64];
+
+static void EmitSignalLog(int sig) {
+  if (!signal_logdir) return;
+  u64 ts = NanoTime();
+  char path[512];
+  internal_snprintf(path, sizeof(path), "%s/%llu", signal_logdir, ts);
+  fd_t fd = __sanitizer::OpenFile(path, __sanitizer::WrOnly);
+  if (fd == kInvalidFd) return;
+  char buf[64];
+  internal_snprintf(buf, sizeof(buf), "%d %llu\n", sig, ts);
+  __sanitizer::WriteToFile(fd, buf, internal_strlen(buf));
+  __sanitizer::CloseFile(fd);
+}
 
 void FlushSignalSafetyReport() {
   static atomic_uint32_t already_flushed = {0};
@@ -1053,6 +1070,7 @@ void FlushSignalSafetyReport() {
 
 void asan_signal_trampoline(int sig, __sanitizer_siginfo *info, void *ctx) {
   __asan_in_signal_handler++;
+  EmitSignalLog(sig);
   auto handler = user_signal_actions[sig].sigaction;
   if (handler)
     handler(sig, info, ctx);
@@ -1061,6 +1079,7 @@ void asan_signal_trampoline(int sig, __sanitizer_siginfo *info, void *ctx) {
 
 void asan_signal_trampoline_handler(int sig) {
   __asan_in_signal_handler++;
+  EmitSignalLog(sig);
   auto handler = user_signal_actions[sig].handler;
   if (handler)
     handler(sig);
