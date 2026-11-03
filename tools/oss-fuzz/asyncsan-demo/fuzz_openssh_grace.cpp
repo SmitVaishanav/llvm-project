@@ -64,13 +64,11 @@ static void arm_timer() {
 static void process_preauth_packet(const uint8_t *data, size_t len) {
   if (len < 4) return;
 
-  // Packet length (first 4 bytes)
-  uint32_t pkt_len = (data[0] << 24) | (data[1] << 16) |
-                     (data[2] << 8) | data[3];
-  if (pkt_len > 35000) pkt_len = 35000;  // SSH max packet
+  // Packet length — clamp to reasonable size
+  size_t pkt_len = data[0] + 1;  // 1–256 bytes
 
   // Allocate packet buffer (like sshbuf)
-  char *pkt = (char *)malloc(pkt_len + 1);
+  char *pkt = (char *)malloc(pkt_len);
   if (!pkt) return;
 
   // Copy available data
@@ -81,9 +79,10 @@ static void process_preauth_packet(const uint8_t *data, size_t len) {
   // "Process" packet — models key exchange / auth parsing
   // These mallocs race with SIGALRM handler's malloc
   for (size_t i = 0; i < copy_len && i < 64; i++) {
-    char *field = (char *)malloc(pkt[i % copy_len] + 16);
+    size_t fsz = ((uint8_t)pkt[i % copy_len]) + 16;
+    char *field = (char *)malloc(fsz);
     if (field) {
-      snprintf(field, pkt[i % copy_len] + 16, "field-%zu", i);
+      snprintf(field, fsz, "field-%zu", i);
       free(field);
     }
   }
