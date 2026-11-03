@@ -296,14 +296,17 @@ def find_reg_calls_fast(proj):
         caller_addr, caller_name = _find_enclosing_function(
             insn.address, func_starts, func_syms
         )
+        preceding = insns[max(0, i - 30):i]
+        signum = _extract_signum(preceding, proj.arch)
         calls.append({
             "reg_fn": reg_fn,
             "call_addr": insn.address,
             "call_idx": i,
             "caller_addr": caller_addr,
             "caller_name": caller_name or f"sub_{insn.address:x}",
-            "preceding_insns": insns[max(0, i - 30):i],
+            "preceding_insns": preceding,
             "all_insns": insns,
+            "signum": signum,
         })
 
         # Record as potential wrapper — even without symbol, use call addr
@@ -393,6 +396,47 @@ def _extract_arg_from_preceding(preceding, target_reg, func_syms):
     return None
 
 
+_SIGNAL_NAMES = {
+    1: "SIGHUP", 2: "SIGINT", 3: "SIGQUIT", 4: "SIGILL",
+    5: "SIGTRAP", 6: "SIGABRT", 7: "SIGBUS", 8: "SIGFPE",
+    9: "SIGKILL", 10: "SIGUSR1", 11: "SIGSEGV", 12: "SIGUSR2",
+    13: "SIGPIPE", 14: "SIGALRM", 15: "SIGTERM", 17: "SIGCHLD",
+    18: "SIGCONT", 19: "SIGSTOP", 20: "SIGTSTP", 21: "SIGTTIN",
+    22: "SIGTTOU", 23: "SIGURG", 26: "SIGVTALRM", 27: "SIGPROF",
+    28: "SIGWINCH", 29: "SIGIO",
+}
+
+
+def _extract_signum(preceding, arch):
+    """Extract signal number (1st arg) from preceding instructions."""
+    if isinstance(arch, archinfo.ArchAArch64):
+        target_regs = {"x0", "w0"}
+    elif isinstance(arch, archinfo.ArchAMD64):
+        target_regs = {"rdi", "edi"}
+    else:
+        return None
+    for j in range(len(preceding) - 1, -1, -1):
+        p = preceding[j]
+        if p.mnemonic in ('call', 'callq', 'bl'):
+            return None  # clobbered
+        if len(p.operands) < 2:
+            continue
+        if p.operands[0].type != 1:
+            continue
+        dst = p.reg_name(p.operands[0].reg)
+        if dst not in target_regs:
+            continue
+        if p.mnemonic in ('mov', 'movl', 'movq') and hasattr(p.operands[1], 'imm'):
+            val = p.operands[1].imm
+            if 1 <= val <= 64:
+                return val
+        if p.mnemonic == 'xor' and p.operands[1].type == 1:
+            if p.reg_name(p.operands[1].reg) == dst:
+                return None  # xor reg,reg = 0
+        return None  # dst written by something else
+    return None
+
+
 def _find_wrapper_callers(proj, wrapper_addr, wrapper_name,
                           func_syms, func_starts, all_plt, reg_calls):
     """Find callers of a wrapper function and extract handler args from them.
@@ -444,6 +488,7 @@ def _find_wrapper_callers(proj, wrapper_addr, wrapper_name,
             _, caller_name = _find_enclosing_function(
                 insn.address, func_starts, func_syms
             )
+            signum = _extract_signum(preceding, proj.arch)
             analysis = analyze_handler(proj, handler_addr, func_starts, all_plt)
             handlers.append({
                 "reg_fn": f"{wrapper_name}→sigaction",
@@ -453,6 +498,7 @@ def _find_wrapper_callers(proj, wrapper_addr, wrapper_name,
                 "is_trivial": analysis["is_trivial"],
                 "unsafe_calls": analysis["unsafe_calls"],
                 "all_calls": analysis["all_calls"],
+                "signum": signum,
             })
 
     return handlers
@@ -696,6 +742,7 @@ def qualify_binary(binary_path, verbose=False, scan_libs=False):
                 "is_trivial": analysis["is_trivial"],
                 "unsafe_calls": analysis["unsafe_calls"],
                 "all_calls": analysis["all_calls"],
+                "signum": call.get("signum"),
             })
 
     # Phase 2: proactively resolve ALL wrapper functions.
@@ -749,7 +796,9 @@ def qualify_binary(binary_path, verbose=False, scan_libs=False):
         print(f"\n  Signal handlers found: {len(handlers)}")
         for h in handlers:
             tag = "TRIVIAL" if h["is_trivial"] else "NON-TRIVIAL"
-            print(f"    [{tag}] {h['handler_name']} "
+            sn = h.get("signum")
+            sig_str = f" for {_SIGNAL_NAMES.get(sn, f'signal {sn}')}" if sn else ""
+            print(f"    [{tag}] {h['handler_name']}{sig_str} "
                   f"(registered by {h['caller']} via {h['reg_fn']})")
             if not h["is_trivial"] and h["unsafe_calls"]:
                 print(f"      Unsafe calls: {', '.join(set(h['unsafe_calls']))}")
@@ -769,7 +818,11 @@ def qualify_binary(binary_path, verbose=False, scan_libs=False):
 
     print()
     if nontrivial:
+        sigs = sorted(set(h.get("signum") for h in nontrivial if h.get("signum")))
+        sig_list = ", ".join(_SIGNAL_NAMES.get(s, str(s)) for s in sigs)
         print(f"  VERDICT: FUZZ — {len(nontrivial)} non-trivial handler(s) found")
+        if sig_list:
+            print(f"  Signals with non-trivial handlers: {sig_list}")
         return True
     elif unresolved:
         print(f"  VERDICT: INVESTIGATE — handler extraction needs manual review")
